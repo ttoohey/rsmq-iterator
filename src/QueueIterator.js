@@ -1,22 +1,42 @@
-import redis from "redis";
-
 const RSMQ = Symbol("RSMQ");
 const QName = Symbol("QName");
 const Iterator = Symbol("Iterator");
-const BlockResolve = Symbol("BlockResolve");
+const Blocks = Symbol("Blocks");
+const ReceiveMessage = Symbol("ReceiveMessage");
+const Connected = Symbol("Connected");
 
 const noop = () => undefined;
+
+function createTimer() {
+  let timeoutID;
+  const set = (callback, delay = 0) =>
+    clear() && (timeoutID = setTimeout(callback, delay));
+  const clear = () => (timeoutID && clearTimeout(timeoutID)) || true;
+  return [set, clear];
+}
 
 class QueueAsyncIterable {
   constructor(iterator) {
     this[Iterator] = iterator;
-    this[BlockResolve] = noop;
-    this.subscribe();
+    this[Blocks] = { [ReceiveMessage]: noop, [Connected]: noop };
+    const rsmq = iterator[RSMQ];
+    rsmq.redis.on("connect", () => this.subscribe());
+    if (rsmq.redis.connected) {
+      this[Connected] = Promise.resolve();
+      this.subscribe();
+    } else {
+      this[Connected] = this.block(Connected);
+      rsmq.redis.on("connect", () => this.unblock(Connected));
+    }
   }
 
   async next() {
+    await this[Connected];
     const parse = this[Iterator].deserialize;
     const response = await this.receiveMessage();
+    if (!response) {
+      return { done: true };
+    }
     const { id, message } = response;
     const data = await parse(message);
     const done = () => this.deleteMessage(id);
@@ -26,20 +46,34 @@ class QueueAsyncIterable {
   }
 
   subscribe() {
+    const unblock = () => this.unblock(ReceiveMessage);
+    const done = () => {
+      const { retry_delay, retry_backoff } = rsmq.redis;
+      const [setDelay] = createTimer();
+      const delayUnblock = ({ delay }) =>
+        setDelay(unblock, delay * retry_backoff + 100);
+      rsmq.redis.on("reconnecting", delayUnblock);
+      rsmq.redis.once("connect", () => {
+        rsmq.redis.off("reconnecting", delayUnblock);
+        setDelay(unblock);
+      });
+      setDelay(unblock, retry_delay * retry_backoff + 100);
+    };
     const qname = this[Iterator][QName];
     const rsmq = this[Iterator][RSMQ];
-    const subscriber = redis.createClient(rsmq.redis.options);
-    subscriber.on("message", () => this.unblock());
+    const subscriber = rsmq.redis.duplicate();
+    rsmq.redis.once("end", () => subscriber.quit(done));
+    subscriber.on("message", unblock);
     subscriber.subscribe(`${rsmq.redisns}rt:${qname}`);
   }
 
-  block() {
-    return new Promise(resolve => (this[BlockResolve] = resolve));
+  block(key) {
+    return new Promise(resolve => (this[Blocks][key] = resolve));
   }
 
-  unblock() {
-    const resolve = this[BlockResolve];
-    this[BlockResolve] = noop;
+  unblock(key) {
+    const resolve = this[Blocks][key];
+    this[Blocks][key] = noop;
     resolve();
   }
 
@@ -48,7 +82,10 @@ class QueueAsyncIterable {
     const rsmq = this[Iterator][RSMQ];
     let response = await rsmq.receiveMessageAsync({ qname });
     while (!response.id) {
-      await this.block();
+      await this.block(ReceiveMessage);
+      if (!rsmq.redis.connected) {
+        return undefined;
+      }
       response = await rsmq.receiveMessageAsync({ qname });
     }
     return response;
