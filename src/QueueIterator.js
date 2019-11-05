@@ -4,6 +4,7 @@ const Iterator = Symbol("Iterator");
 const Blocks = Symbol("Blocks");
 const ReceiveMessage = Symbol("ReceiveMessage");
 const Connected = Symbol("Connected");
+const Attributes = Symbol("QueueAttributes");
 
 const noop = () => undefined;
 
@@ -20,6 +21,11 @@ class QueueAsyncIterable {
     this[Iterator] = iterator;
     this[Blocks] = { [ReceiveMessage]: noop, [Connected]: noop };
     const rsmq = iterator[RSMQ];
+    const qname = iterator[QName];
+    rsmq.getQueueAttributes(
+      { qname },
+      (err, resp) => (this[Attributes] = resp)
+    );
     rsmq.redis.on("connect", () => this.subscribe());
     if (rsmq.redis.connected) {
       this[Connected] = Promise.resolve();
@@ -39,7 +45,9 @@ class QueueAsyncIterable {
     }
     const { id, message } = response;
     const data = await parse(message);
-    const done = () => this.deleteMessage(id);
+    const [setDelay, clearDelay] = createTimer();
+    setDelay(() => this.unblock(ReceiveMessage), this[Attributes].vt * 1000);
+    const done = () => clearDelay() && this.deleteMessage(id);
     const info = () => response;
     const value = { data, done, info };
     return { value };
