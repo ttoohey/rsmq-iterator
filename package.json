@@ -1,6 +1,6 @@
 {
   "name": "rsmq-iterator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An async iterator for a RedisSMQ message queue",
   "homepage": "https://github.com/ttoohey/rsmq-iterator",
   "keywords": [
